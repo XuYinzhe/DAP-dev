@@ -1,5 +1,5 @@
 <h1 align="center">
-Depth Any Panoramas:<br>
+[CVPR 2026] Depth Any Panoramas:<br>
 A Foundation Model for Panoramic Depth Estimation
 </h1>
 
