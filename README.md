@@ -4,7 +4,7 @@
 Clone the repo first:
 
 ```Bash
-git clone https://github.com/Insta360-Research-Team/DAP
+git clone https://github.com/XuYinzhe/DAP-dev.git
 cd DAP
 ```
 
