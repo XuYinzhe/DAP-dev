@@ -9,7 +9,7 @@ model:
 
 
 median_align: False
-load_weights_dir: /home/tione/notebook/home/songmeixi_insta360.com/depth/panda_orgindual/ckpt_save/1111/trainw1_2_dualw1_2/weights_0
+load_weights_dir: /homes/shaun/main/DAP/weights
 input:
   height: 512
   width: 1024

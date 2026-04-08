@@ -1,0 +1,3 @@
+[submodule "thirdparty/diff-gaussian-rasterization-omni"]
+	path = thirdparty/diff-gaussian-rasterization-omni
+	url = https://github.com/XuYinzhe/diff-gaussian-rasterization-omni.git
