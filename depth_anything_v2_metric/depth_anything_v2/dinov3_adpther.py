@@ -53,15 +53,18 @@ class DINOv3Adapter(nn.Module):
     def get_intermediate_layers(
         self, x, n=1, return_class_token=False, norm=True
     ):
+        # input: [1, 3, 512, 1024], n=[4,11,17,23], return_class_token=True (example)
         outputs = self.model.get_intermediate_layers(
             x, n=n, reshape=False, return_class_token=True, norm=norm
         )
+        # raw model returns 4 outputs
 
         patch_maps, cls_tokens = [], []
         H, W = x.shape[-2], x.shape[-1]
         h, w = H // self.patch_size, W // self.patch_size  
 
-        for (out_all, out_cls) in outputs:
+        for idx, (out_all, out_cls) in enumerate(outputs):
+            # raw output: out_all [1, 2048, 1024], out_cls [1, 1024] (for 512x1024 input)
             if norm:
                 out_all = self.norm(out_all)
 
@@ -78,6 +81,7 @@ class DINOv3Adapter(nn.Module):
             if grid.shape[-2:] != (h, w):
                 grid = F.interpolate(grid, size=(h, w), mode="bilinear", align_corners=False)
 
+            # processed patch_map: [1, 1024, 32, 64], cls_token: [1, 1024] (for 512x1024 input)
             patch_maps.append(grid.contiguous())
             cls_tokens.append(out_cls)
 

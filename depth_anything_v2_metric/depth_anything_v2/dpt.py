@@ -115,6 +115,7 @@ class DPTHead(nn.Module):
         )
     
     def forward(self, out_features, patch_h, patch_w, patch_size=16):
+        # e.g. patch_h=32, patch_w=64, patch_size=16, num_features=4 (for 512x1024 input)
         out = []
         for i, x in enumerate(out_features):
             if self.use_clstoken:
@@ -135,19 +136,20 @@ class DPTHead(nn.Module):
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
             out.append(x)
+            # layer shapes: [1,256,128,256], [1,512,64,128], [1,1024,32,64], [1,1024,16,32]
 
         layer_1, layer_2, layer_3, layer_4 = out
         layer_1_rn = self.scratch.layer1_rn(layer_1)
         layer_2_rn = self.scratch.layer2_rn(layer_2)
         layer_3_rn = self.scratch.layer3_rn(layer_3)
         layer_4_rn = self.scratch.layer4_rn(layer_4)
-        path_4 = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
-        path_3 = self.scratch.refinenet3(path_4,  layer_3_rn, size=layer_2_rn.shape[2:])
-        path_2 = self.scratch.refinenet2(path_3,  layer_2_rn, size=layer_1_rn.shape[2:])
-        path_1 = self.scratch.refinenet1(path_2,  layer_1_rn)
-        out = self.scratch.output_conv1(path_1)
-        out = F.interpolate(out, (int(patch_h * patch_size), int(patch_w * patch_size)), mode="bilinear", align_corners=True)
-        out = self.scratch.output_conv2(out)
+        path_4 = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])   # [1, 256, 32, 64]
+        path_3 = self.scratch.refinenet3(path_4,  layer_3_rn, size=layer_2_rn.shape[2:])  # [1, 256, 64, 128]
+        path_2 = self.scratch.refinenet2(path_3,  layer_2_rn, size=layer_1_rn.shape[2:])  # [1, 256, 128, 256]
+        path_1 = self.scratch.refinenet1(path_2,  layer_1_rn)  # [1, 256, 256, 512]
+        out = self.scratch.output_conv1(path_1)  # [1, 128, 256, 512]
+        out = F.interpolate(out, (int(patch_h * patch_size), int(patch_w * patch_size)), mode="bilinear", align_corners=True)  # [1, 128, 512, 1024]
+        out = self.scratch.output_conv2(out)  # [1, 1, 512, 1024]
         return out
 
 
@@ -189,11 +191,13 @@ class DepthAnythingV2(nn.Module):
     def forward(self, x):
         patch_size = getattr(self.pretrained, "patch_size", 16)  # DINOv3=16
         patch_h, patch_w = x.shape[-2] // patch_size, x.shape[-1] // patch_size
-
+        # input: [1, 3, 512, 1024], patch_size=16, patch_h=32, patch_w=64 (example)
 
         features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder], return_class_token=True)
-        depth = self.depth_head(features, patch_h, patch_w, patch_size) * self.max_depth
-        mask  = self.mask_head(features, patch_h, patch_w, patch_size)
+        # 4 intermediate features, each: patch_map [1, 1024, 32, 64], cls_token [1, 1024]
+
+        depth = self.depth_head(features, patch_h, patch_w, patch_size) * self.max_depth  # [1, 1, 512, 1024]
+        mask  = self.mask_head(features, patch_h, patch_w, patch_size)  # [1, 1, 512, 1024]
 
         return depth.squeeze(1), mask.squeeze(1)
     

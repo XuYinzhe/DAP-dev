@@ -49,15 +49,16 @@ class DAP(nn.Module):
     def forward(self, image):
         if image.dim() == 3:
             image = image.unsqueeze(0)
-
+        # shape: [1, 3, H, W] -> e.g. [1, 3, 512, 1024]
         erp_pred, mask_pred = self.core(image)
+        # core output: erp_pred [1, 512, 1024], mask_pred [1, 512, 1024] (for 512x1024 input)
         erp_pred = erp_pred.unsqueeze(1)
         erp_pred[erp_pred < 0] = 0
         mask_pred = mask_pred.unsqueeze(1)
         outputs = {}
         outputs["pred_depth"] = erp_pred * self.max_depth
         outputs["pred_mask"] = mask_pred
-
+        # final outputs: pred_depth [1, 1, 512, 1024], pred_mask [1, 1, 512, 1024] (for 512x1024 input)
 
         return outputs
 
