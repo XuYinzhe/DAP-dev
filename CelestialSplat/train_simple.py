@@ -365,19 +365,21 @@ def train_one_epoch(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_dir', type=str, 
-                        default='/homes/shaun/main/dataset/tartanair360/AbandonedSchool/Data_hard/P000/')
+                        default='/homes/shaun/main/dataset/tartanair360/',
+                        help='Root directory containing all TartanAir sequences '
+                             '(e.g., /path/to/tartanair360/)')
     parser.add_argument('--config', type=str, default='config/infer.yaml',
                         help='Path to DAP config file')
     parser.add_argument('--chunk_size', type=int, default=4)
+    parser.add_argument('--chunk_stride', type=int, default=2)
     parser.add_argument('--image_size', type=int, nargs=2, default=[512, 1024])
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--num_epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--max_frames', type=int, default=None)
+    parser.add_argument('--num_sequences', type=int, default=None,
+                        help='Limit to first N sequences (for debugging)')
     parser.add_argument('--sh_degree', type=int, default=0, choices=[0, 1, 2, 3],
                         help='Spherical harmonics degree (0=RGB only, faster)')
-    parser.add_argument('--camera_name', type=str, default='lcam_custom0',
-                        help='Camera name for finding image/pose files')
     args = parser.parse_args()
     
     if not HAS_RASTERIZER:
@@ -394,11 +396,11 @@ def main():
     print(f"\nLoading dataset from {args.data_dir}...")
     dataset = TartanAir360Dataset(
         root_dir=args.data_dir,
-        chunk_size=args.chunk_size,
         image_size=tuple(args.image_size),
         mode='train',
-        max_frames=args.max_frames,
-        camera_name=args.camera_name,
+        num_sequences=args.num_sequences,
+        chunk_size=args.chunk_size,
+        chunk_stride=args.chunk_stride,
     )
     
     dataloader = DataLoader(

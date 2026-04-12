@@ -29,6 +29,22 @@ def _init_weights(m):
 
 
 @dataclass
+@dataclass
+class FusionConfig:
+    """Configuration for Gaussian fusion strategy."""
+    strategy: str = 'simple'  # 'simple', 'voxel', or custom
+    # Simple strategy params
+    conf_thresh: float = 0.1
+    opacity_thresh: float = 0.01
+    # Voxel strategy params
+    voxel_size: float = 0.1
+    max_gs_per_voxel: int = 2
+    conf_weight: float = 0.7
+    opacity_weight: float = 0.3
+    # Future: additional strategy-specific params
+
+
+@dataclass
 class CelestialSplatConfig:
     """Configuration for CelestialSplat model."""
     # DAP backbone config
@@ -52,6 +68,9 @@ class CelestialSplatConfig:
     # GS Decoder config
     decoder_hidden_dim: int = 128
     sh_degree: int = 2  # Spherical harmonics degree (2 -> 27 channels)
+    
+    # Gaussian Fusion config
+    fusion = FusionConfig()
     
     # ERP image config
     image_height: int = 512
@@ -437,7 +456,7 @@ class CrossViewTransformer(nn.Module):
         cos_lat = torch.cos(lat)
         x = cos_lat * torch.sin(lon)
         y = torch.sin(-lat)  # flip y because positive lat should be up
-        z = cos_lat * torch.cos(lon)
+        z = cos_lat * torch.cos(lon)  # Forward is -Z (TartanAir convention)
         
         # Stack directions [H, W, 3]
         directions = torch.stack([x, y, z], dim=-1)
@@ -551,27 +570,212 @@ class GSDecoder(nn.Module):
         }
 
 
+class GaussianFusionStrategy:
+    """
+    Base class for Gaussian fusion strategies.
+    
+    This allows easy swapping and experimentation with different fusion methods:
+    - SimpleFusion: Original flatten + threshold
+    - VoxelDeduplication: Voxel-based deduplication to reduce redundancy
+    - Future: Learned compression, clustering-based, etc.
+    """
+    
+    def __call__(
+        self,
+        means: torch.Tensor,          # [B, P, 3]
+        scales: torch.Tensor,         # [B, P, 3]
+        rotations: torch.Tensor,      # [B, P, 4]
+        opacities: torch.Tensor,      # [B, P, 1]
+        shs: torch.Tensor,            # [B, P, K, 3]
+        confidences: torch.Tensor,    # [B, P, 1]
+        masks: torch.Tensor,          # [B, P]
+        metadata: Dict,               # Extra info (num_views, etc.)
+    ) -> Dict[str, torch.Tensor]:
+        """Apply fusion strategy."""
+        raise NotImplementedError
+
+
+class SimpleFusion(GaussianFusionStrategy):
+    """
+    Simple fusion: just flatten and threshold.
+    This is the original behavior.
+    """
+    
+    def __call__(self, means, scales, rotations, opacities, shs, confidences, masks, metadata):
+        return {
+            'means': means,
+            'scales': scales,
+            'rotations': rotations,
+            'opacities': opacities,
+            'shs': shs,
+            'confidences': confidences,
+            'masks': masks,
+            'num_per_view': metadata.get('num_per_view', means.shape[1]),
+            'num_views': metadata.get('num_views', 1),
+        }
+
+
+class VoxelDeduplicationFusion(GaussianFusionStrategy):
+    """
+    Voxel-based deduplication fusion.
+    
+    Divides space into voxels and keeps only top-k Gaussians per voxel
+    based on confidence scores. This reduces redundant Gaussians in
+    overlapping view regions.
+    
+    Args:
+        voxel_size: Size of each voxel in world coordinates
+        max_gs_per_voxel: Maximum number of Gaussians to keep per voxel
+        conf_weight: Weight for confidence in scoring (0-1)
+        opacity_weight: Weight for opacity in scoring (0-1)
+    """
+    
+    def __init__(
+        self,
+        voxel_size: float = 0.1,
+        max_gs_per_voxel: int = 2,
+        conf_weight: float = 0.7,
+        opacity_weight: float = 0.3,
+    ):
+        self.voxel_size = voxel_size
+        self.max_gs_per_voxel = max_gs_per_voxel
+        self.conf_weight = conf_weight
+        self.opacity_weight = opacity_weight
+    
+    def __call__(self, means, scales, rotations, opacities, shs, confidences, masks, metadata):
+        B, P, _ = means.shape
+        device = means.device
+        
+        # Compute scores for each Gaussian
+        scores = (
+            self.conf_weight * confidences +
+            self.opacity_weight * opacities
+        ).squeeze(-1)  # [B, P]
+        
+        # Assign each Gaussian to a voxel
+        voxel_coords = torch.floor(means / self.voxel_size).long()  # [B, P, 3]
+        
+        # Create unique voxel IDs for each batch
+        # Hash: (x, y, z) -> single int, with batch offset
+        batch_size = 100000  # Large enough offset
+        voxel_ids = (
+            voxel_coords[..., 0] +
+            voxel_coords[..., 1] * batch_size +
+            voxel_coords[..., 2] * batch_size * batch_size +
+            torch.arange(B, device=device).view(B, 1) * batch_size**3
+        )  # [B, P]
+        
+        # Process each batch separately
+        all_outputs = []
+        for b in range(B):
+            valid_mask = masks[b]  # [P]
+            valid_indices = torch.where(valid_mask)[0]
+            
+            if len(valid_indices) == 0:
+                # No valid Gaussians, return empty
+                empty = torch.zeros(0, 3, device=device)
+                all_outputs.append({
+                    'means': empty,
+                    'scales': empty,
+                    'rotations': torch.zeros(0, 4, device=device),
+                    'opacities': torch.zeros(0, 1, device=device),
+                    'shs': torch.zeros(0, *shs.shape[2:], device=device),
+                    'confidences': torch.zeros(0, 1, device=device),
+                    'masks': torch.zeros(0, dtype=torch.bool, device=device),
+                })
+                continue
+            
+            # Get valid Gaussians
+            v_ids = voxel_ids[b, valid_indices]  # [N_valid]
+            v_scores = scores[b, valid_indices]  # [N_valid]
+            
+            # For each voxel, keep top-k Gaussians
+            unique_voxels = torch.unique(v_ids)
+            selected_indices = []
+            
+            for v_id in unique_voxels:
+                in_voxel = (v_ids == v_id)
+                voxel_indices = valid_indices[in_voxel]
+                voxel_scores = v_scores[in_voxel]
+                
+                # Sort by score and take top-k
+                k = min(self.max_gs_per_voxel, len(voxel_scores))
+                top_k = torch.topk(voxel_scores, k).indices
+                selected_indices.append(voxel_indices[top_k])
+            
+            selected_indices = torch.cat(selected_indices)
+            
+            # Gather selected Gaussians
+            all_outputs.append({
+                'means': means[b, selected_indices],
+                'scales': scales[b, selected_indices],
+                'rotations': rotations[b, selected_indices],
+                'opacities': opacities[b, selected_indices],
+                'shs': shs[b, selected_indices],
+                'confidences': confidences[b, selected_indices],
+                'masks': torch.ones(len(selected_indices), dtype=torch.bool, device=device),
+            })
+        
+        # Batch the outputs (note: different batch items may have different sizes)
+        # For now, return list format; caller should handle variable sizes
+        return all_outputs
+
+
 class GaussianFusion(nn.Module):
     """
     Fuse per-view Gaussians into unified world-coordinate Gaussians.
     
-    Strategy:
-    1. Convert each view's pixel-wise Gaussians from camera to world coordinates
-    2. Flatten all views into unified representation
-    3. Filter low-confidence/low-opacity Gaussians (optional)
+    Supports multiple fusion strategies via pluggable strategy classes.
+    
+    Usage:
+        # Simple fusion (default)
+        fusion = GaussianFusion(strategy='simple')
+        
+        # Voxel deduplication
+        fusion = GaussianFusion(
+            strategy='voxel',
+            voxel_size=0.1,
+            max_gs_per_voxel=2
+        )
     """
     
-    def __init__(self, conf_thresh: float = 0.1, opacity_thresh: float = 0.01):
+    def __init__(
+        self,
+        strategy: str = 'simple',
+        conf_thresh: float = 0.1,
+        opacity_thresh: float = 0.01,
+        **strategy_kwargs
+    ):
+        """
+        Args:
+            strategy: Fusion strategy - 'simple', 'voxel', or custom strategy instance
+            conf_thresh: Minimum confidence for valid Gaussians
+            opacity_thresh: Minimum opacity for valid Gaussians
+            **strategy_kwargs: Additional arguments for the strategy (e.g., voxel_size)
+        """
         super().__init__()
         self.conf_thresh = conf_thresh
         self.opacity_thresh = opacity_thresh
+        
+        # Set up strategy
+        if strategy == 'simple':
+            self.strategy = SimpleFusion()
+        elif strategy == 'voxel':
+            self.strategy = VoxelDeduplicationFusion(**strategy_kwargs)
+        elif isinstance(strategy, GaussianFusionStrategy):
+            self.strategy = strategy
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
+        
+        self.strategy_name = strategy if isinstance(strategy, str) else strategy.__class__.__name__
     
     def forward(
         self,
         per_view_gaussians: Dict[str, torch.Tensor],
         poses: torch.Tensor,
         img_h: int,
-        img_w: int
+        img_w: int,
+        return_raw: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -584,21 +788,88 @@ class GaussianFusion(nn.Module):
                 - confidence: [B, N, H, W]
             poses: [B, N, 4, 4] camera poses (world-to-camera)
             img_h, img_w: Original image dimensions for ERP projection
+            return_raw: If True, also return raw (unfused) Gaussians for debugging
         
         Returns:
-            Unified Gaussians in world coordinates:
-                - means: [B, P, 3] where P = N*H*W
-                - scales: [B, P, 3]
-                - rotations: [B, P, 4]
-                - opacities: [B, P, 1]
-                - shs: [B, P, K, 3]
-                - confidences: [B, P, 1]
-                - masks: [B, P] (valid Gaussians after filtering)
+            Unified Gaussians in world coordinates (format depends on strategy):
+                - means: [B, P, 3] or List[[P_i, 3]]
+                - scales: [B, P, 3] or List[[P_i, 3]]
+                - rotations: [B, P, 4] or List[[P_i, 4]]
+                - opacities: [B, P, 1] or List[[P_i, 1]]
+                - shs: [B, P, K, 3] or List[[P_i, K, 3]]
+                - confidences: [B, P, 1] or List[[P_i, 1]]
+                - masks: [B, P] or List[[P_i]]
         """
         B, N, H, W = per_view_gaussians['depth'].shape
         device = per_view_gaussians['depth'].device
         
-        # ERP focal lengths (same as in _depth_to_3d_erp)
+        # Step 1: Convert to world coordinates (common to all strategies)
+        means_world, all_params = self._convert_to_world(
+            per_view_gaussians, poses, img_h, img_w
+        )
+        
+        # Step 2: Create validity mask
+        confidences = all_params['confidences']
+        opacities = all_params['opacities']
+        conf_mask = confidences.squeeze(-1) > self.conf_thresh
+        opacity_mask = opacities.squeeze(-1) > self.opacity_thresh
+        masks = conf_mask & opacity_mask
+        
+        # Step 3: Apply fusion strategy
+        metadata = {
+            'num_per_view': H * W,
+            'num_views': N,
+            'img_h': img_h,
+            'img_w': img_w,
+        }
+        
+        result = self.strategy(
+            means=means_world,
+            scales=all_params['scales'],
+            rotations=all_params['rotations'],
+            opacities=opacities,
+            shs=all_params['shs'],
+            confidences=confidences,
+            masks=masks,
+            metadata=metadata,
+        )
+        
+        # Handle variable-size outputs (for strategies like voxel)
+        if isinstance(result, list):
+            # Variable-size batch (each item has different number of Gaussians)
+            # Return as list for now; caller needs to handle appropriately
+            output = {
+                'gaussians': result,  # List of dicts
+                'is_variable_size': True,
+                'num_gaussians_per_item': [len(r['means']) for r in result],
+            }
+        else:
+            output = result
+            output['is_variable_size'] = False
+        
+        output['strategy'] = self.strategy_name
+        
+        if return_raw:
+            output['raw'] = {
+                'means': means_world,
+                **all_params,
+                'masks': masks,
+            }
+        
+        return output
+    
+    def _convert_to_world(
+        self,
+        per_view_gaussians: Dict[str, torch.Tensor],
+        poses: torch.Tensor,
+        img_h: int,
+        img_w: int,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Convert per-view Gaussians to world coordinates."""
+        B, N, H, W = per_view_gaussians['depth'].shape
+        device = per_view_gaussians['depth'].device
+        
+        # ERP focal lengths
         fx = img_w / (2 * math.pi)
         fy = -img_h / math.pi
         cx = img_w / 2
@@ -613,7 +884,7 @@ class GaussianFusion(nn.Module):
         lon = ((u + 0.5) - cx) / fx
         lat = ((v + 0.5) - cy) / fy
         
-        # LonLat to XYZ directions (unit vectors)
+        # LonLat to XYZ directions
         cos_lat = torch.cos(lat)
         x_dir = cos_lat * torch.sin(lon)
         y_dir = torch.sin(-lat)
@@ -624,69 +895,49 @@ class GaussianFusion(nn.Module):
         all_means_cam = []
         for i in range(N):
             depth = per_view_gaussians['depth'][:, i]  # [B, H, W]
-            # [B, H, W, 3] = [B, H, W, 1] * [H, W, 3]
-            pts_cam = depth.unsqueeze(-1) * directions
+            pts_cam = depth.unsqueeze(-1) * directions  # [B, H, W, 3]
             all_means_cam.append(pts_cam)
         
         all_means_cam = torch.stack(all_means_cam, dim=1)  # [B, N, H, W, 3]
         
-        # Transform to world coordinates: X_world = R^T @ (X_cam - t)
+        # Transform to world coordinates
+        # TartanAir pose is camera-to-world (c2w): X_world = R @ X_cam + t
         all_means_world = []
         for i in range(N):
             pts_cam = all_means_cam[:, i]  # [B, H, W, 3]
-            R = poses[:, i, :3, :3]  # [B, 3, 3]
-            t = poses[:, i, :3, 3]   # [B, 3]
+            R = poses[:, i, :3, :3]  # [B, 3, 3] - c2w rotation
+            t = poses[:, i, :3, 3]   # [B, 3] - c2w translation
             
-            # X_world = R^T @ (X_cam - t)
+            # c2w transformation: X_world = R @ X_cam + t
             pts_world = torch.einsum(
-                'bij,bhwj->bhwi', 
-                R.transpose(-2, -1), 
-                pts_cam - t.unsqueeze(1).unsqueeze(1)
-            )
+                'bij,bhwj->bhwi',
+                R,
+                pts_cam
+            ) + t.unsqueeze(1).unsqueeze(1)
             all_means_world.append(pts_world)
         
         all_means_world = torch.stack(all_means_world, dim=1)  # [B, N, H, W, 3]
-        
-        # Flatten spatial dimensions
         P = N * H * W
         means = all_means_world.reshape(B, P, 3)
         
-        # Process other Gaussian parameters
-        # covariance: [B, N, 3, H, W] -> [B, P, 3]
+        # Process other parameters
         scales = per_view_gaussians['covariance'].permute(0, 1, 3, 4, 2).reshape(B, P, 3)
-        
-        # rotation: [B, N, 4, H, W] -> [B, P, 4]
         rotations = per_view_gaussians['rotation'].permute(0, 1, 3, 4, 2).reshape(B, P, 4)
-        
-        # opacity: [B, N, H, W] -> [B, P, 1]
         opacities = per_view_gaussians['opacity'].reshape(B, P, 1)
         
-        # sh_color: [B, N, C, H, W] -> [B, P, K, 3]
-        # where C = K * 3 (K SH coeffs per RGB channel)
         sh_color = per_view_gaussians['sh_color']  # [B, N, C, H, W]
         C = sh_color.shape[2]
-        K = C // 3  # Number of SH coefficients
-        # Reshape to [B, N, K, 3, H, W] then permute to [B, N, H, W, K, 3]
+        K = C // 3
         shs = sh_color.reshape(B, N, K, 3, H, W).permute(0, 1, 4, 5, 2, 3).reshape(B, P, K, 3)
         
-        # confidence: [B, N, H, W] -> [B, P, 1]
         confidences = per_view_gaussians['confidence'].reshape(B, P, 1)
         
-        # Create validity mask
-        conf_mask = confidences.squeeze(-1) > self.conf_thresh
-        opacity_mask = opacities.squeeze(-1) > self.opacity_thresh
-        masks = conf_mask & opacity_mask  # [B, P]
-        
-        return {
-            'means': means,
+        return means, {
             'scales': scales,
             'rotations': rotations,
             'opacities': opacities,
             'shs': shs,
             'confidences': confidences,
-            'masks': masks,
-            'num_per_view': H * W,
-            'num_views': N,
         }
 
 
@@ -731,7 +982,23 @@ class CelestialSplat(nn.Module):
         )
         
         # Gaussian fusion for unified representation
-        self.gaussian_fusion = GaussianFusion()
+        fusion_config = self.config.fusion
+        if fusion_config.strategy == 'voxel':
+            self.gaussian_fusion = GaussianFusion(
+                strategy='voxel',
+                conf_thresh=fusion_config.conf_thresh,
+                opacity_thresh=fusion_config.opacity_thresh,
+                voxel_size=fusion_config.voxel_size,
+                max_gs_per_voxel=fusion_config.max_gs_per_voxel,
+                conf_weight=fusion_config.conf_weight,
+                opacity_weight=fusion_config.opacity_weight,
+            )
+        else:
+            self.gaussian_fusion = GaussianFusion(
+                strategy='simple',
+                conf_thresh=fusion_config.conf_thresh,
+                opacity_thresh=fusion_config.opacity_thresh,
+            )
     
     def set_dap_model(self, dap_model):
         """Set the DAP model (for loading pretrained weights)."""
