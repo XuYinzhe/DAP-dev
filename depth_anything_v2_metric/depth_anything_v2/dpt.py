@@ -43,7 +43,8 @@ class DPTHead(nn.Module):
         features=256,
         use_bn=False, 
         out_channels=[256, 512, 1024, 1024], 
-        use_clstoken=False
+        use_clstoken=False,
+        duplicate_depth = False
     ):
         super(DPTHead, self).__init__()
         
@@ -105,18 +106,20 @@ class DPTHead(nn.Module):
         
         head_features_1 = features
         head_features_2 = 32
+
+        output_channels = 1 if not duplicate_depth else 2
         
         self.scratch.output_conv1 = nn.Conv2d(head_features_1, head_features_1 // 2, kernel_size=3, stride=1, padding=1)
         self.scratch.output_conv2 = nn.Sequential(
             nn.Conv2d(head_features_1 // 2, head_features_2, kernel_size=3, stride=1, padding=1),
             nn.ReLU(True),
-            nn.Conv2d(head_features_2, 1, kernel_size=1, stride=1, padding=0),
+            nn.Conv2d(head_features_2, output_channels, kernel_size=1, stride=1, padding=0),
             nn.Sigmoid()
         )
     
-    def forward(self, out_features, patch_h, patch_w, patch_size=16):
+    def forward(self, out_features, patch_h, patch_w, patch_size=16, return_features=False):
         # e.g. patch_h=32, patch_w=64, patch_size=16, num_features=4 (for 512x1024 input)
-        out = []
+        feats = []
         for i, x in enumerate(out_features):
             if self.use_clstoken:
                 x, cls_token = x[0], x[1]
@@ -135,10 +138,10 @@ class DPTHead(nn.Module):
 
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
-            out.append(x)
+            feats.append(x)
             # layer shapes: [1,256,128,256], [1,512,64,128], [1,1024,32,64], [1,1024,16,32]
 
-        layer_1, layer_2, layer_3, layer_4 = out
+        layer_1, layer_2, layer_3, layer_4 = feats
         layer_1_rn = self.scratch.layer1_rn(layer_1)
         layer_2_rn = self.scratch.layer2_rn(layer_2)
         layer_3_rn = self.scratch.layer3_rn(layer_3)
@@ -149,7 +152,10 @@ class DPTHead(nn.Module):
         path_1 = self.scratch.refinenet1(path_2,  layer_1_rn)  # [1, 256, 256, 512]
         out = self.scratch.output_conv1(path_1)  # [1, 128, 256, 512]
         out = F.interpolate(out, (int(patch_h * patch_size), int(patch_w * patch_size)), mode="bilinear", align_corners=True)  # [1, 128, 512, 1024]
-        out = self.scratch.output_conv2(out)  # [1, 1, 512, 1024]
+        out = self.scratch.output_conv2(out)  # [1, 1, 512, 1024], or [1, 2, 512, 1024] if duplicate_depth=True
+        
+        if return_features:
+            return out, feats
         return out
 
 
@@ -165,6 +171,7 @@ class DepthAnythingV2(nn.Module):
         dinov3_repo_dir="",     # 你的本地 repo
         dinov3_arch="",           # 例如 'dinov3_vitl16'
         dinov3_weight="",
+        duplicate_depth = False
     ):
         super().__init__()
         
@@ -184,7 +191,7 @@ class DepthAnythingV2(nn.Module):
             arch=dinov3_arch,
             weight_path=dinov3_weight
         )
-        self.depth_head = DPTHead(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken)
+        self.depth_head = DPTHead(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken, duplicate_depth=duplicate_depth)
         self.mask_head = DPTHead(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken)
         self.patch_size = int(self.pretrained.patch_size)
 

@@ -16,9 +16,10 @@ class DAP(nn.Module):
         super().__init__()
         midas_model_type = args.midas_model_type
         fine_tune_type = args.fine_tune_type
-        min_depth = args.min_depth
+        self.min_depth = args.min_depth
         self.max_depth = args.max_depth
         train_decoder = args.train_decoder
+        self.duplicate_depth = getattr(args, 'duplicate_depth', False)  # 默认为 False，如果配置中没有该参数
 
         # Pre-defined setting of the model
         model_configs = {
@@ -37,7 +38,8 @@ class DAP(nn.Module):
             **{**model_configs[midas_model_type], 'max_depth': 1.0},
             dinov3_repo_dir=dinov3_repo_dir,
             dinov3_arch=dinov3_arch,
-            dinov3_weight=dinov3_weight
+            dinov3_weight=dinov3_weight,
+            duplicate_depth = self.duplicate_depth
         )
 
 
@@ -108,11 +110,12 @@ class DAP(nn.Module):
         return image, (h, w)
     
 @register('dap')
-def make_model(midas_model_type='vitl', fine_tune_type='none', min_depth=0.001, max_depth=1.0, train_decoder=True):
+def make_model(midas_model_type='vitl', fine_tune_type='none', min_depth=0.001, max_depth=1.0, train_decoder=True, duplicate_depth=False):
     args = Namespace()
     args.midas_model_type = midas_model_type
     args.fine_tune_type = fine_tune_type
     args.min_depth = min_depth
     args.max_depth = max_depth
     args.train_decoder = train_decoder
+    args.duplicate_depth = duplicate_depth
     return DAP(args)

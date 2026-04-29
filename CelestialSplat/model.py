@@ -29,7 +29,6 @@ def _init_weights(m):
 
 
 @dataclass
-@dataclass
 class FusionConfig:
     """Configuration for Gaussian fusion strategy."""
     strategy: str = 'simple'  # 'simple', 'voxel', or custom
@@ -88,10 +87,11 @@ class DAPFeatureAdapter(nn.Module):
     Output: [B, out_dim, H/16, W/16]
     """
     
-    def __init__(self, in_dim: int = 1024, out_dim: int = 256, num_layers: int = 4):
+    def __init__(self, in_dim: int = 1024, out_dim: int = 256, num_layers: int = 4, use_cls_token: bool = False):
         super().__init__()
         self.num_layers = num_layers
         self.hidden_dim = out_dim // num_layers  # 64 if out_dim=256
+        self.use_cls_token = use_cls_token
         
         # Project each layer feature to hidden_dim
         self.patch_projs = nn.ModuleList([
@@ -103,10 +103,11 @@ class DAPFeatureAdapter(nn.Module):
         ])
         
         # Optional: cls token projection for global modulation
-        self.cls_proj = nn.Sequential(
-            nn.Linear(in_dim, out_dim),
-            nn.ReLU(inplace=True)
-        )
+        if self.use_cls_token:
+            self.cls_proj = nn.Sequential(
+                nn.Linear(in_dim, out_dim),
+                nn.ReLU(inplace=True)
+            )
         
         self.apply(_init_weights)
     
@@ -123,7 +124,7 @@ class DAPFeatureAdapter(nn.Module):
         local_feat = torch.cat(outs, dim=1)  # [B, out_dim, H/16, W/16]
         
         # Global feature modulation
-        if cls_tokens is not None:
+        if cls_tokens is not None and self.use_cls_token:
             global_feat = self.cls_proj(cls_tokens.mean(dim=1))  # [B, out_dim]
             local_feat = local_feat + global_feat[:, :, None, None]
         
@@ -516,15 +517,17 @@ class GSDecoder(nn.Module):
     
     def forward(
         self,
-        fused_feat: torch.Tensor,   # [B, N, C, H, W]
-        depth_prior: torch.Tensor,  # [B, N, H_full, W_full]
-        mask: torch.Tensor          # [B, N, H_full, W_full]
+        fused_feat: torch.Tensor,      # [B, N, C, H, W]
+        depth_prior: torch.Tensor,     # [B, N, H_full, W_full]
+        dap_mask: torch.Tensor,        # [B, N, H_full, W_full] - DAP sky mask probabilities
+        dap_confidence: torch.Tensor,  # [B, N, H_full, W_full] - DAP confidence (1=valid, 0=sky)
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
             fused_feat: [B, N, C, H, W] at 1/16 resolution
             depth_prior: [B, N, H_full, W_full] from DAP
-            mask: [B, N, H_full, W_full] from DAP
+            dap_mask: [B, N, H_full, W_full] - DAP sky mask probabilities
+            dap_confidence: [B, N, H_full, W_full] - binary confidence (1=valid, 0=sky)
         Returns:
             Dict with Gaussian parameters
         """
@@ -545,12 +548,18 @@ class GSDecoder(nn.Module):
         sh = self.head_sh(x)            # [B*N, 27, H, W]
         conf = torch.sigmoid(self.head_conf(x))        # [B*N, 1, H, W]
         
-        # Apply mask (sky regions should have zero depth)
-        mask_expanded = mask.flatten(0, 1)[:, None, :, :]  # [B*N, 1, H, W]
+        # Apply DAP sky mask (sky regions should have zero depth)
+        mask_expanded = dap_mask.flatten(0, 1)[:, None, :, :]  # [B*N, 1, H, W]
         
         # Depth residual (DAP prior + predicted delta)
         depth = depth_prior.flatten(0, 1)[:, None, :, :] + delta_d
         depth = depth * (1 - mask_expanded)  # Zero depth in sky regions
+        
+        # Combine predicted confidence with DAP confidence (sky mask)
+        # dap_confidence: 1 for valid, 0 for sky
+        dap_conf_flat = dap_confidence.flatten(0, 1)  # [B*N, H, W]
+        dap_conf_expanded = dap_conf_flat[:, None, :, :]  # [B*N, 1, H, W]
+        combined_conf = conf * dap_conf_expanded  # Zero confidence for sky regions
         
         # Normalize rotation quaternion
         rot = F.normalize(rot, dim=1)
@@ -560,13 +569,14 @@ class GSDecoder(nn.Module):
             return t.view(B, N, *t.shape[1:])
         
         return {
-            'depth': restore(depth).squeeze(2),         # [B, N, H, W]
-            'covariance': restore(cov),                  # [B, N, 3, H, W]
-            'rotation': restore(rot),                    # [B, N, 4, H, W]
-            'opacity': restore(opacity).squeeze(2),     # [B, N, H, W]
-            'sh_color': restore(sh),                     # [B, N, 27, H, W]
-            'confidence': restore(conf).squeeze(2),     # [B, N, H, W]
-            'delta_depth': restore(delta_d).squeeze(2)  # For monitoring
+            'depth': restore(depth).squeeze(2),           # [B, N, H, W]
+            'covariance': restore(cov),                    # [B, N, 3, H, W]
+            'rotation': restore(rot),                      # [B, N, 4, H, W]
+            'opacity': restore(opacity).squeeze(2),       # [B, N, H, W]
+            'sh_color': restore(sh),                       # [B, N, 27, H, W]
+            'confidence': restore(combined_conf).squeeze(2),  # [B, N, H, W] - combined with DAP mask
+            'delta_depth': restore(delta_d).squeeze(2),   # For monitoring
+            'dap_confidence': restore(dap_conf_flat),     # [B, N, H, W] - for reference
         }
 
 
@@ -741,7 +751,7 @@ class GaussianFusion(nn.Module):
     
     def __init__(
         self,
-        strategy: str = 'simple',
+        strategy: str = 'voxel',
         conf_thresh: float = 0.1,
         opacity_thresh: float = 0.01,
         **strategy_kwargs
@@ -1041,22 +1051,24 @@ class CelestialSplat(nn.Module):
         # Flatten for DAP processing
         images_flat = images.view(B * N, *images.shape[2:])  # [B*N, 3, H, W]
         
-        # 1. DAP forward - get depth, mask, and intermediate features
+        # 1. DAP forward - get depth, mask, confidence, and intermediate features
         with torch.no_grad():
             dap_out = self._forward_dap(images_flat)
         
-        depth = dap_out['depth']      # [B*N, H, W]
-        mask = dap_out['mask']        # [B*N, H, W]
-        features = dap_out['features']  # List of 4 tensors [B*N, 1024, H/16, W/16]
+        depth = dap_out['depth']                # [B*N, H, W]
+        mask = dap_out['mask']                  # [B*N, H, W] - raw logits
+        dap_confidence = dap_out['dap_confidence']  # [B*N, H, W] - binary (1=valid, 0=sky)
+        features = dap_out['features']          # List of 4 tensors [B*N, 1024, H/16, W/16]
         cls_tokens = dap_out.get('cls_tokens')  # [B*N, 4, 1024]
         
         # 2. Adapt features
         adapted_features = self.feature_adapter(features, cls_tokens)  # [B*N, 256, H/16, W/16]
         adapted_features = adapted_features.view(B, N, *adapted_features.shape[1:])  # [B, N, 256, H/16, W/16]
         
-        # Reshape depth and mask
+        # Reshape depth, mask, and confidence
         depth = depth.view(B, N, H, W)
         mask = mask.view(B, N, H, W)
+        dap_confidence = dap_confidence.view(B, N, H, W)
         
         # 3. Cross-view transformer fusion
         fused_features = self.transformer(
@@ -1067,9 +1079,16 @@ class CelestialSplat(nn.Module):
         )  # [B, N, 256, H/16, W/16]
         
         # 4. GS decoder - outputs per-view Gaussians
-        per_view_gaussians = self.gs_decoder(fused_features, depth, mask)
+        # Pass DAP mask and confidence to filter sky regions
+        per_view_gaussians = self.gs_decoder(
+            fused_features, 
+            depth, 
+            dap_mask=mask,
+            dap_confidence=dap_confidence
+        )
         
         # 5. Fuse into unified world-coordinate Gaussians
+        # GaussianFusion uses confidence to filter out sky regions (confidence=0 for sky)
         unified_gaussians = self.gaussian_fusion(
             per_view_gaussians, 
             poses, 
@@ -1081,6 +1100,7 @@ class CelestialSplat(nn.Module):
             'gaussians': unified_gaussians,
             'dap_depth': depth,
             'dap_mask': mask,
+            'dap_confidence': dap_confidence,
         }
         
         if return_intermediates:
@@ -1092,13 +1112,14 @@ class CelestialSplat(nn.Module):
         
         return outputs
     
-    def _forward_dap(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _forward_dap(self, images: torch.Tensor, sky_threshold: float = 0.5) -> Dict[str, torch.Tensor]:
         """
         Forward through DAP model.
         
         Returns dict with:
             - depth: [B, H, W]
-            - mask: [B, H, W]
+            - mask: [B, H, W] - DAP sky mask probabilities
+            - dap_confidence: [B, H, W] - Binary confidence (1=valid, 0=sky)
             - features: List of 4 tensors [B, 1024, H/16, W/16]
             - cls_tokens: [B, 4, 1024]
         """
@@ -1135,13 +1156,19 @@ class CelestialSplat(nn.Module):
         
         # Forward through DPT heads
         depth = dap_core.depth_head(raw_features, patch_h, patch_w, patch_size) * dap_core.max_depth
-        mask = dap_core.mask_head(raw_features, patch_h, patch_w, patch_size)
+        pred_mask = dap_core.mask_head(raw_features, patch_h, patch_w, patch_size)
+        
+        # pred_mask is already a probability map from DAP
+        # Following test/infer.py: valid = (1 - pred_mask) > 0.5, so sky = pred_mask >= 0.5
+        sky_mask = pred_mask.squeeze(1) > sky_threshold  # [B, H, W] - True for sky
+        dap_confidence = (~sky_mask).float()  # [B, H, W] - 1 for valid, 0 for sky
         
         return {
-            'depth': depth.squeeze(1),  # [B, H, W]
-            'mask': mask.squeeze(1),    # [B, H, W]
-            'features': patch_maps,      # List of 4 tensors
-            'cls_tokens': cls_tokens     # [B, 4, 1024]
+            'depth': depth.squeeze(1),           # [B, H, W]
+            'mask': pred_mask.squeeze(1),        # [B, H, W] - probability map
+            'dap_confidence': dap_confidence,    # [B, H, W] - binary confidence (1=valid, 0=sky)
+            'features': patch_maps,              # List of 4 tensors
+            'cls_tokens': cls_tokens             # [B, 4, 1024]
         }
     
     def get_trainable_params(self, freeze_dap: bool = True) -> List[nn.Parameter]:

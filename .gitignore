@@ -1,3 +1,7 @@
+.vscode
 __pycache__
 *.pth
 *output*
+test_*
+verify_*
+skills
